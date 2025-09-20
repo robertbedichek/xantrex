@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Xantrex Performance</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --pad: 16px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+           margin: var(--pad); line-height: 1.35; }
+    h2 { margin: 0 0 8px 0; }
+    .panel { margin-bottom: 28px; }
+    #xantrexPlot, #enphasePlot { width: 100%; height: 72vh; }
+    @media (max-width: 900px) { #xantrexPlot, #enphasePlot { height: 64vh; } }
+  </style>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+</head>
+<body>
+  <div class="panel">
+    <h2>Xantrex XW Inverter/Charger Operation</h2>
+    <div id="xantrexPlot"></div>
+  </div>
+
+  <div class="panel">
+    <h2>PV Power (kW)</h2>
+    <div id="enphasePlot"></div>
+  </div>
+
+  <script>
+  /* ========= SHARED HELPERS (single source of truth) ========= */
+  (function (global) {
+    const S = { _rows: null, _promise: null };
+
+    // Local-time parser: "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS"
+    function parseStampLocal(stamp) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(String(stamp).trim());
+      if (!m) return null;
+      return new Date(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]); // LOCAL time
+    }
+
+    // STRICT line parser: expects 9 numeric fields after the timestamp.
+    //   DCV DCI AC-In-A AC-In-V AC-Out-A AC-Out-V SOC Enphase2015 Enphase2023
+    function parseLine(line) {
+      if (!line) return null;
+      line = line.trim();
+      if (!line || line[0] === '#') return null;
+
+      const parts = line.split(/\s+/);
+
+      // Timestamp could be one token (…T…) or two tokens (date + time).
+      let ts, idx;
+      if (/^\d{4}-\d{2}-\d{2}T/.test(parts[0])) { ts = parts[0]; idx = 1; }
+      else if (/^\d{4}-\d{2}-\d{2}$/.test(parts[0])) { ts = parts[0] + " " + (parts[1] || ""); idx = 2; }
+      else return null;
+
+      const t = parseStampLocal(ts);
+      if (!t || isNaN(t)) return null;
+
+      const nums = parts.slice(idx).map(Number);
+      if (nums.length !== 9 || nums.some(n => !Number.isFinite(n))) return null;
+
+      const [dcv, dci, inA, inV, outA, outV, soc, enp15, enp23] = nums;
+
+      return {
+        t,
+        BatteryVoltage: dcv,
+        BatteryCurrent: dci,
+        UtilInputCurrent: inA,
+        UtilInputVoltage: inV,
+        OutCurrent: outA,
+        OutVoltage: outV,
+        StateOfCharge: soc,
+        Enphase2015KW: enp15,
+        Enphase2023KW: enp23
+      };
+    }
+
+    // One-time loader with cached Promise; pass force=true to refresh both charts.
+    async function loadData(force = false) {
+      if (!S._promise || force) {
+        S._promise = (async () => {
+          const res = await fetch("xantrex.txt?ts=" + Date.now(), { cache: "no-store" });
+          let text = await res.text();
+
+          // Repair wrapped numbers (if a number fell to the next line).
+          text = text.replace(/\n\s+(\d+(?:\.\d+)?)/g, " $1");
+
+          const rows = [];
+          for (const line of text.split(/\r?\n/)) {
+            const r = parseLine(line);
+            if (r) rows.push(r);
+          }
+          rows.sort((a,b) => a.t - b.t);
+          S._rows = rows;
+          return rows;
+        })();
+      }
+      return S._promise;
+    }
+
+    function getRows() { return S._rows || []; }
+
+    global.Xantrex = { parseStampLocal, parseLine, loadData, getRows };
+  })(window);
+
+  /* ========= CHART 1: main Xantrex plot ========= */
+  function buildTraces(rows) {
+    const x = rows.map(r => r.t);
+    const traces = [
+      { name: "Battery Voltage (V)",       y: rows.map(r => r.BatteryVoltage),   yaxis: "y",  hover: "BV: %{y:.2f} V" },
+      { name: "Utility Input Voltage (V)", y: rows.map(r => r.UtilInputVoltage), yaxis: "y",  hover: "UI V: %{y:.0f} V" },
+      { name: "Output Voltage (V)",        y: rows.map(r => r.OutVoltage),       yaxis: "y",  hover: "Out V: %{y:.0f} V" },
+
+      { name: "Battery Current (A)",       y: rows.map(r => r.BatteryCurrent),   yaxis: "y2", hover: "BC: %{y:.2f} A" },
+      { name: "Utility Input Current (A)", y: rows.map(r => r.UtilInputCurrent), yaxis: "y2", hover: "UI I: %{y:.2f} A" },
+      { name: "Output Current (A)",        y: rows.map(r => r.OutCurrent),       yaxis: "y2", hover: "Out I: %{y:.2f} A" },
+
+      { name: "State of Charge (%)",       y: rows.map(r => r.StateOfCharge),    yaxis: "y3", hover: "SOC: %{y:.0f} %", line: { dash: "dot" } },
+
+    ].map(tr => ({
+      type: "scatter",
+      mode: "lines",
+      x, y: tr.y, name: tr.name, yaxis: tr.yaxis,
+      line: { shape: "hv", ...(tr.line || {}) }, // step-ish default; Enphase overridden to linear
+      hovertemplate: "%{x|%Y-%m-%d %H:%M:%S}<br>" + tr.hover + "<extra></extra>"
+    }));
+    return traces;
+  }
+
+  function layoutMain() {
+    return {
+      margin: { l: 70, r: 180, t: 56, b: 40 },
+      xaxis: {
+        title: "Time",
+        type: "date",
+        rangeselector: {
+          x: 0, y: 1.12, xanchor: "left", yanchor: "top",
+          buttons: [
+            { step: "hour", count: 1, stepmode: "backward", label: "1h" },
+            { step: "hour", count: 6, stepmode: "backward", label: "6h" },
+            { step: "day",  count: 1, stepmode: "backward", label: "24h" },
+            { step: "day",  count: 7, stepmode: "backward", label: "7d" },
+            { step: "all", label: "All" }
+          ]
+        },
+        rangeslider: { visible: true, thickness: 0.08 }
+      },
+      yaxis:  { title: "Voltage (V)", rangemode: "tozero" },
+      yaxis2: { title: "Current (A)", overlaying: "y", side: "right", rangemode: "tozero" },
+      yaxis3: { title: "State of Charge (%)", overlaying: "y", side: "right", position: 1.08, range: [0, 100], showgrid: false },
+      yaxis4: { title: "Power (kW)", overlaying: "y", side: "right", position: 1.18, rangemode: "tozero", showgrid: false },
+      legend: { orientation: "h", y: -0.2 },
+      hovermode: "x unified",
+      uirevision: "keep",
+      title: { text: "Xantrex Inverter/Charger Operation" }
+    };
+  }
+
+  /* ========= CHART 2: PV-only (Enphase) plot ========= */
+  function buildEnphase(rows) {
+    const x = rows.map(r => r.t);
+    const traces = [
+      { name: "Enphase 2015 (kW)", y: rows.map(r => r.Enphase2015KW), yaxis: "y", hover: "2015: %{y:.2f} kW" },
+      { name: "Enphase 2023 (kW)", y: rows.map(r => r.Enphase2023KW), yaxis: "y", hover: "2023: %{y:.2f} kW", line: { dash: "dash" } }
+    ].map(tr => ({
+      type: "scatter",
+      mode: "lines",
+      x, y: tr.y, name: tr.name, yaxis: tr.yaxis,
+      line: { shape: "linear", ...(tr.line || {}) },
+      hovertemplate: "%{x|%Y-%m-%d %H:%M:%S}<br>" + tr.hover + "<extra></extra>"
+    }));
+    return traces;
+  }
+
+  function layoutEnphase() {
+    return {
+      margin: { l: 60, r: 40, t: 40, b: 40 },
+      xaxis: { title: "Time", type: "date", rangeslider: { visible: true, thickness: 0.08 } },
+      yaxis: { title: "kW", rangemode: "tozero" },
+      legend: { orientation: "h", y: -0.2 },
+      hovermode: "x unified",
+      uirevision: "keep",
+      title: { text: "Photovoltaic Power Production (kilowatts)" }
+    };
+  }
+
+  /* ========= Draw both charts (single data load, reused) ========= */
+  (async () => {
+    const rows = await Xantrex.loadData();         // fetch + parse ONCE
+    Plotly.newPlot("xantrexPlot",  buildTraces(rows),  layoutMain(),    { responsive: true, displaylogo: false });
+    Plotly.newPlot("enphasePlot",  buildEnphase(rows), layoutEnphase(), { responsive: true, displaylogo: false });
+  })();
+
+  /* ========= Optional: auto-refresh both charts =========
+  async function refreshAll() {
+    const rows = await Xantrex.loadData(true); // force reload
+    Plotly.react("xantrexPlot", buildTraces(rows),  layoutMain());
+    Plotly.react("enphasePlot", buildEnphase(rows), layoutEnphase());
+  }
+  // setInterval(refreshAll, 60_000);
+  */
+  </script>
+</body>
+
+
+<H2>Utility and inverter power</H2>
+<div class="mermaid">
+%%{init:{
+  "theme":"default",
+  "flowchart":{"htmlLabels":false,"useMaxWidth":true,"wrap":true,"nodeSpacing":40,"rankSpacing":50},
+  "fontFamily":"Arial, Helvetica, sans-serif"
+}}%%
+flowchart LR
+  GRID["Utility / Meter"] <--> MAIN["Utility Load Panel\n(Main service panel)"]
+  MAIN --> ULOADSUB["Utility Power Subpanel"]
+  ULOADSUB --> ULOADS["Utility Powered Loads (not backed up)"]
+
+  MAIN <-->|"Feeder/Breaker (AC IN)"| XW["Xantrex XW 6048\nInverter/Charger\n(internal transfer)"]
+
+  GEN["Generator Input"] --> XW
+  XW <-->|"AC OUT"| FHLP["Front Home Load Panel\n(Inverter-fed / backed loads)"]
+  FHLP --> LOADS["House loads"]
+  FHLP <--> RHLP["Rear Home Load Panel"]
+  RHLP --> MORELOADS["House loads"]
+
+  %% PV AC-coupled downstream (two independent arrays)
+  subgraph PV2015["Roof Solar — Enphase2015"]
+    direction LR
+    PANELS15["PV array\n(23) 270W Suniva Panels"] --> MIs15["Micro-inverters (AC)\n(23) Enphase M215 Microinverters"]
+  end
+  MIs15 -- "PV backfeed breaker" --> RHLP
+
+  subgraph PV2021["Roof Solar — Enphase2021"]
+    direction LR
+    PANELS21["PV array\n(10) 425W LG NeON Panels"] --> MIs21["Micro-inverters (AC)\n(10) Enphase IQ7A Microinverters"]
+  end
+  MIs21 -- "PV backfeed breaker" --> RHLP
+
+  %% 48 VDC battery: two 8× DC6-400 strings in parallel
+  subgraph BATT["48 VDC battery"]
+    direction TB
+    subgraph STR1["String A"]
+      direction LR
+      A1["DC6-400"] --- A2["DC6-400"] --- A3["DC6-400"] --- A4["DC6-400"] --- A5["DC6-400"] --- A6["DC6-400"] --- A7["DC6-400"] --- A8["DC6-400"]
+      end
+    subgraph STR2["String B"]
+      direction LR
+      B1["DC6-400"] --- B2["DC6-400"] --- B3["DC6-400"] --- B4["DC6-400"] --- B5["DC6-400"] --- B6["DC6-400"] --- B7["DC6-400"] --- B8["DC6-400"]
+    end
+    BUSP["+ 48 V DC bus"]
+    BUSN["- 48 V DC bus"]
+    A8 --- BUSP
+    B8 --- BUSP
+    A1 --- BUSN
+    B1 --- BUSN
+  end
+
+  BUSP <-->|"+ DC"| XW
+  BUSN <-->|"- DC"| XW
+
+  %% (optional) thicken the main AC path: GRID⇄MAIN, MAIN⇄XW, XW⇄FHLP
+  linkStyle 0 stroke:#000,stroke-width:3.5px,opacity:1;
+  linkStyle 1 stroke:#000,stroke-width:3.5px,opacity:1;
+  linkStyle 2 stroke:#000,stroke-width:3.5px,opacity:1;
+
+</div>
+
+<style>
+  .mermaid{max-width:100%} .mermaid svg{height:auto}
+</style>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad:true, flowchart:{ htmlLabels:false, useMaxWidth:true, wrap:true }});
+</script>
+
+
+<br>
+<h3>System description</H3>
+
+This diagram shows the relationship between the utility power connection, the inverter/charger (XW), the batteries, and our solar panels.  The inverter/charger takes utility power (230VAC - center tapped) and 48VDC as inputs and generates power for our household (also 230VAC center-tapped).  
+<p>
+
+When the utility power is not present or is unstable, the XW converts power from the battery (on its DC input) into 230VAC power to supply our household.  
+When the utility power is present and stable on the XW utility input, it is connected directly to the XW output.  The utility power is also used to charge the battery (the XW's DC connection is both an input and an output).  There is also a generator input to the Xantrex, which is not shown in the diagram, but its voltage and current are not graphed.
+<p>
+In normal operation the voltage input and voltage output in the graph above are around 120VAC. The XW's AC inputs and outputs are center-tapped to create two legs, L1, and L2, and the inverter reports the average leg voltage relative to neutral. Between L1 and L2 is 230VAC, normal for North American household wiring. 
+
+<p>
+
