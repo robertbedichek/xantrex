@@ -1,5 +1,9 @@
 #! /bin/bash
 
+Old_Enphase_name="enphase2015"
+Old_Enphase_port="80"
+New_Enphase_name="enphase2021"
+
 DATA_DIR=/var/log/xantrex
 Xantrex_name=xantrex
 Xantrex_port=80
@@ -12,7 +16,7 @@ TOKEN=`cat ${XANTREX_DIR}/token.txt`
 BATTERY_WATT_HOURS=40000
 
  if [[ "$(/bin/date +%M)" = 00 ]]; then
-   echo "# Date     Time     DCV  DCI AC-In-Amps AC-In-Volts  AC-Out-Amps AC-Out-Volts SoC Enphase-kW" | /usr/bin/env ssh -i $HOME/.ssh/id_rsa root@bedichek.org "cat >> /var/www/html/home/xantrex.txt"
+   echo "# Date     Time     DCV  DCI AC-In-Amps AC-In-Volts  AC-Out-Amps AC-Out-Volts SoC Enphase2015-kW Enphase2021-kW" | /usr/bin/env ssh -i $HOME/.ssh/id_rsa root@bedichek.org "cat >> /var/www/html/home/xantrex.txt"
  fi
 
 /bin/rm -f ${DATA_DIR}/xantrex_inverter.xml.temp ${DATA_DIR}/xantrex_inverter.xml
@@ -69,12 +73,9 @@ if [ -s "${DATA_DIR}/xantrex_inverter.xml.temp" ]; then
   # communications gateway, extract the information, put
   # it into a gnuplot-compatible format, and create a new plot.
   
-  Enphase_name="enphase"
-  Enphase_port="80"
-  
   /bin/rm -f ${DATA_DIR}/old_enphase.temp ${DATA_DIR}/old_enphase.http
 
-  ${CURL} -s http://${Enphase_name}:${Enphase_port}/home >${DATA_DIR}/old_enphase.temp 2> /dev/null
+  ${CURL} -s http://${Old_Enphase_name}:${Old_Enphase_port}/home >${DATA_DIR}/old_enphase.temp 2> /dev/null
   
   if [ -s "${DATA_DIR}/old_enphase.temp" ]; then
     mv ${DATA_DIR}/old_enphase.temp ${DATA_DIR}/old_enphase.http
@@ -89,14 +90,20 @@ if [ -s "${DATA_DIR}/xantrex_inverter.xml.temp" ]; then
     egrep ' W</td>' ${DATA_DIR}/old_enphase.line >/dev/null
   
     if [ "$?" == "0" ]; then
-      OLD_ENPHASE_KW=`cat ${DATA_DIR}/old_enphase.line | sed -e 's/.*generating<\/td> *<td> *\([0-9\.]*\) W.*/0.\1/'`
+
+      # Parse assuming the number is in Watts (because we found "W</td>" e.g.:
+      # <tr><td>Lifetime generation</td>    <td> 88.6 MWh</td></tr><tr><td>Currently generating</td>    <td>  70.0 W</td></tr>
+
+      OLD_ENPHASE_KW=`cat ${DATA_DIR}/old_enphase.line | sed -e 's/.*generating<\/td> *<td> *\([0-9\.]*\) W.*/\1/'`
+      OLD_ENPHASE_KW=`echo "scale=3; $OLD_ENPHASE_KW / 1000.0" | bc -l`
     else
+      # Parse assuming the number is in kilo Watts (because we didn't find a "W</td>"
       OLD_ENPHASE_KW=`cat ${DATA_DIR}/old_enphase.line | sed -e 's/.*generating<\/td> *<td> *\([0-9\.]*\) kW.*/\1/'`
     fi
   
     echo -n " ${OLD_ENPHASE_KW}" >>${DATA_DIR}/xantrex.data
   fi
-  ${CURL} -fsSk -H "Accept: application/json" -H "Authorization: Bearer $TOKEN" "https://192.168.87.32/api/v1/production" | jq . >${DATA_DIR}/new_enphase.json
+  ${CURL} -fsSk -H "Accept: application/json" -H "Authorization: Bearer $TOKEN" "https://${New_Enphase_name}/api/v1/production" | jq . >${DATA_DIR}/new_enphase.json
   if [ -s "${DATA_DIR}/new_enphase.json" ]; then
     NEW_ENPHASE_W=`jq -r '.wattsNow // 0' ${DATA_DIR}/new_enphase.json`
 
